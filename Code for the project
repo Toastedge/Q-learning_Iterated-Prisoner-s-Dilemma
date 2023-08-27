@@ -1,0 +1,308 @@
+from gymnasium.spaces import Discrete, Dict
+from pettingzoo import ParallelEnv
+import numpy as np
+import functools
+
+class IPDPettingZooEnv(ParallelEnv):
+    def __init__(self, reward_matrix, n=1, render_mode=None):
+        self.reward_matrix = reward_matrix
+        self.n = 100  # Number of rounds to play
+        self.current_step = 0  # Current game round
+        self.render_mode = render_mode
+
+        self.possible_agents = ["agent1", "agent2"]
+        self.observation_spaces = {
+            agent: Discrete(4)
+            for agent in self.possible_agents
+        }
+        self.action_spaces = {
+            agent: Discrete(2)  # Changed here
+            for agent in self.possible_agents
+        }
+
+        self._agent_dones = {agent: False for agent in self.possible_agents}
+        self._last_agent_actions = {agent: None for agent in self.possible_agents}
+    
+    def get_episode_length(self):
+        return self.n
+
+    @functools.lru_cache(maxsize=None)
+    def observation_space(self, agent):
+        return self.observation_spaces[agent]
+
+    @functools.lru_cache(maxsize=None)
+    def action_space(self, agent):
+        return self.action_spaces[agent]
+
+    def render(self):
+        if self.render_mode == 'human':
+            print(f'Current step: {self.current_step}, Agents: {self.agents}')
+
+    def reset(self, seed=None, options=None):
+        self.agents = self.possible_agents[:]
+        self.current_step = 0
+        observations = {agent: np.array([0]*2*self.n, dtype=np.int8) for agent in self.agents}
+        infos = {agent: {} for agent in self.agents}
+        self._agent_dones = {agent: False for agent in self.agents}
+        self._last_agent_actions = {agent: None for agent in self.agents}
+        return observations, infos
+
+    def step(self, actions):
+        self.current_step += 1
+        assert isinstance(actions, dict), "actions must be a dictionary"
+        for agent, action in actions.items():
+            assert agent in self.agents, f"{agent} is not a valid agent for this environment"
+            assert action in [0, 1], f"{action} is not a valid action. The action must be either 0 or 1"
+            self._agent_dones[agent] = True
+            self._last_agent_actions[agent] = action
+
+        last_actions = [self._last_agent_actions[agent] for agent in self.agents]
+
+        # debugging information
+        print(f"Last actions: {last_actions}")
+        assert max(last_actions) < len(self.reward_matrix), "Actions exceed reward matrix dimensions."
+
+        rewards = {
+            self.agents[0]: self.reward_matrix[int(last_actions[0])][int(last_actions[1])][0],
+            self.agents[1]: self.reward_matrix[int(last_actions[0])][int(last_actions[1])][1]
+        }
+
+        # Determine the next state based on the last actions
+        next_state = 0
+        if last_actions[0] == 0 and last_actions[1] == 1:
+            next_state = 1
+        elif last_actions[0] == 1 and last_actions[1] == 0:
+            next_state = 2
+        elif last_actions[0] == 1 and last_actions[1] == 1:
+            next_state = 3
+
+        observations = {
+        agent: next_state
+        for agent in self.agents
+        }
+
+        terminations = {agent: self.current_step >= self.n for agent in self.agents}
+
+        infos = {agent: {} for agent in self.agents}
+        if self.current_step >= self.n:
+            self.agents = []
+
+        if self.render_mode == "human":
+            self.render()
+        return observations, rewards, terminations, infos
+# Define the reward matrix you want to use
+reward_matrix = [
+    [[3, 3], [0, 5]],
+    [[5, 0], [1, 1]]
+]
+
+if __name__ == "__main__":
+    env = IPDPettingZooEnv(reward_matrix)
+
+class QLearningAgent:
+    def __init__(self, env, agent_name, individual_reward_weight=1.0, team_reward_weight=0, learning_rate=0.1, discount_factor=0.95, exploration_rate=1.0, exploration_decay_rate=0.003):
+        self.env = env
+        self.agent_name = agent_name
+        self.individual_reward_weight = individual_reward_weight
+        self.team_reward_weight = team_reward_weight
+        self.learning_rate = learning_rate
+        self.discount_factor = discount_factor
+        self.exploration_rate = exploration_rate
+        self.exploration_decay_rate = exploration_decay_rate
+
+        # Initialize Q-table to be zeros. Assumes each agent has action and observation space of size 2.
+        self.q_table = np.zeros((4, 2))
+
+    def get_action(self, state):
+        # Exploration vs exploitation
+        if np.random.uniform(0, 1) < self.exploration_rate:
+            # Exploration
+            action = self.env.action_spaces[self.agent_name].sample()
+        else:
+            # Exploitation
+            action = np.argmax(self.q_table[state])
+        return action
+
+    def update_q_table(self, state, action, reward, next_state, team_reward):
+        # Combine individual and team rewards
+        combined_reward = self.individual_reward_weight * reward + self.team_reward_weight * team_reward
+
+        # Q-learning update rule
+        self.q_table[state][action] = (1 - self.learning_rate) * self.q_table[state][action] \
+            + self.learning_rate * (combined_reward + self.discount_factor * np.max(self.q_table[next_state]))
+
+    def decay_exploration_rate(self):
+        self.exploration_rate = self.exploration_rate * np.exp(-self.exploration_decay_rate)
+
+# Initialize environment and agents
+env = IPDPettingZooEnv(reward_matrix)
+observations, _ = env.reset()  # You need to call env.reset() to initialize the agents
+agents = [QLearningAgent(env, name) for name in env.agents]
+
+import pandas as pd
+# Define the moving average function
+def moving_average(data, window_size):
+    return pd.Series(data).rolling(window=window_size).mean().tolist()
+
+# Initialize agent and team reward storage
+agent_rewards = {agent.agent_name: [] for agent in agents}
+team_rewards = []
+
+# Number of episodes for training
+num_episodes = 2000
+
+q_table_history = {agent.agent_name: [] for agent in agents}
+for episode in range(num_episodes):
+    episode_rewards = {agent.agent_name: 0 for agent in agents}
+    episode_team_reward = 0
+    observations, _ = env.reset()
+
+    while True:
+        actions = {agent.agent_name: agent.get_action(observations[agent.agent_name]) for agent in agents}
+        next_observations, rewards, done, _ = env.step(actions)
+        team_reward = sum(rewards.values())
+
+        episode_team_reward += team_reward
+        for agent in agents:
+            agent.update_q_table(observations[agent.agent_name], actions[agent.agent_name], rewards[agent.agent_name], next_observations[agent.agent_name],team_reward)
+            episode_rewards[agent.agent_name] += rewards[agent.agent_name]
+
+        if all(done.values()):
+            print('/done')
+            break
+
+        observations = next_observations
+
+    episode_length = env.get_episode_length()
+    team_rewards.append(episode_team_reward/episode_length)
+    for agent_name in agent_rewards:
+        agent_rewards[agent_name].append(episode_rewards[agent_name]/ episode_length)
+
+
+    for agent in agents:
+        agent.decay_exploration_rate()
+        q_table_history[agent.agent_name].append(agent.q_table.copy())
+
+for agent in agents:
+    print(f"Q-table for {agent.agent_name}:")
+    print(agent.q_table)
+
+import matplotlib.pyplot as plt
+from matplotlib import gridspec
+
+# Compute the moving averages of the rewards
+window_size = 50  # Adjust the window size to change the smoothing level
+smoothed_agent_rewards = {agent_name: moving_average(rewards, window_size) for agent_name, rewards in agent_rewards.items()}
+smoothed_team_rewards = moving_average(team_rewards, window_size)
+
+# Create a new figure with GridSpec layout
+fig = plt.figure(figsize=(8, 6))  # Adjust the size as per your requirement
+gs = gridspec.GridSpec(2, 2)
+
+# Agent rewards over time
+ax0 = fig.add_subplot(gs[0])
+for agent_name, rewards in smoothed_agent_rewards.items():
+    ax0.plot(rewards, label=f"{agent_name} rewards")
+ax0.set_xlabel('Episodes')
+ax0.set_ylabel('Average rewards')
+ax0.legend()
+ax0.set_title('Agent rewards over time')
+
+# Team rewards over time
+ax1 = fig.add_subplot(gs[1])
+ax1.plot(smoothed_team_rewards, label='Team rewards')
+ax1.set_xlabel('Episodes')
+ax1.set_ylabel('Average team rewards')
+ax1.legend()
+ax1.set_title('Team rewards over time')
+
+# Plotting the action preference for agent 1
+ax2 = fig.add_subplot(gs[2])
+agent_name = list(q_table_history.keys())[0]  # assuming the first agent is agent 1
+q_tables = q_table_history[agent_name]
+
+annotations = []
+for i in range(4):
+    action_diff = [q_table[i][0] - q_table[i][1] for q_table in q_tables]
+    ax2.plot(action_diff, label=f"State {i}")
+    annotation = ax2.annotate(f"{action_diff[-1]:.2f}", xy=(len(action_diff)-1, action_diff[-1]), textcoords="offset points", xytext=(0,0), ha='center')
+    annotations.append(annotation)
+
+adaptive_placement(ax2, annotations)
+ax2.axhline(0, color='gray', linewidth=0.8)
+ax2.set_title(f"Action preference for {agent_name}")
+ax2.set_xlabel('Episodes')
+ax2.set_ylabel('Action Preference')
+ax2.legend()
+
+# Plotting the action preference for agent 2
+ax3 = fig.add_subplot(gs[3])
+agent_name = list(q_table_history.keys())[1]  # assuming the second agent is agent 2
+q_tables = q_table_history[agent_name]
+
+annotations = []
+for i in range(4):
+    action_diff = [q_table[i][0] - q_table[i][1] for q_table in q_tables]
+    ax3.plot(action_diff, label=f"State {i}")
+    annotation = ax3.annotate(f"{action_diff[-1]:.2f}", xy=(len(action_diff)-1, action_diff[-1]), textcoords="offset points", xytext=(0,0), ha='center')
+    annotations.append(annotation)
+
+adaptive_placement(ax3, annotations)
+ax3.axhline(0, color='gray', linewidth=0.8)
+ax3.set_title(f"Action preference for {agent_name}")
+ax3.set_xlabel('Episodes')
+ax3.set_ylabel('Action Preference')
+ax3.legend()
+
+# Adjust the layout of the plots in the figure
+plt.tight_layout()
+
+# Save the figure with high resolution (300 dpi)
+plt.savefig('combined_figure.png', dpi=300)
+plt.show()
+
+# Extracting the action preference values for episodes between 20 and 250
+action_preferences = {agent_name: [q_table[i][0] - q_table[i][1] for q_table in q_tables[20:250]] for agent_name, q_tables in q_table_history.items()}
+
+# Calculating the mean for values greater than 0 and less than 0 for each agent
+area_values = {}
+for agent_name, preferences in action_preferences.items():
+    positive_values = [value for value in preferences if value > 0]
+    negative_values = [value for value in preferences if value < 0]
+    
+    positive_area = sum(positive_values)  if positive_values else 0
+    negative_area = sum(negative_values)  if negative_values else 0
+    
+    area_values[agent_name] = {
+        "positive_area": positive_area,
+        "negative_area": negative_area,
+        "p":positive_area/(positive_area - negative_area)
+    }
+
+area_values
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Define the function for p(a)
+def p(a):
+    p_values = (3 - 4*a) / (3 - a)
+    return np.clip(p_values, 0, 1)  # Clip the values to [0, 1]
+
+# Define the range for a
+a_values = np.linspace(0, 1, 1000)
+
+# Compute the corresponding p values
+p_values = p(a_values)
+
+# Plot the graph
+plt.plot(a_values, p_values, label="p(a)")
+plt.xlabel('a (Weight of Individual Rewards)')
+plt.ylabel('p (Probability of Cooperation)')
+plt.title('Probability of Cooperation as a Function of Individual Reward Weight')
+plt.axhline(y=0, color='gray', linewidth=0.8)  # Add horizontal line at 0 for reference
+plt.axhline(y=1, color='gray', linewidth=0.8)  # Add horizontal line at 1 for reference
+plt.legend()
+plt.grid(True)
+plt.show()
+
